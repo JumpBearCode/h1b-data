@@ -52,71 +52,150 @@ h1bdata.info 展示的数据列非常简洁，只有 **6 个字段**：
 
 ---
 
-## Refined Schema: 32 Columns
+## Refined Schema: 38 Columns
 
-从原始 98 列中精选 32 列，分为 **核心展示字段** 和 **分析/筛选字段**。
+从原始 98 列中精选并合并为 38 列，分为 **核心展示字段** 和 **分析/筛选字段**。
 
-### A. 核心展示字段（用户直接看到的）
+### 合并字段说明
+
+为了保持 38 列不变同时加入雇主地址信息，对以下字段做了合并：
+
+| 合并操作 | 原始字段 | 合并后字段 | 合并逻辑 |
+|---------|---------|-----------|---------|
+| 地址合并 | `EMPLOYER_ADDRESS1` + `EMPLOYER_ADDRESS2` | `EMPLOYER_ADDRESS` | `CONCAT_WS(', ', addr1, addr2)`，忽略空值 |
+| 联系人姓名合并 | `EMPLOYER_POC_FIRST_NAME` + `EMPLOYER_POC_LAST_NAME` | `EMPLOYER_POC_NAME` | `CONCAT_WS(' ', first, last)`，忽略空值 |
+
+同时新增了 `EMPLOYER_POSTAL_CODE`（邮编），砍掉了 `EMPLOYER_POC_PHONE`（联系人电话）。
+
+### A. 核心展示字段（用户直接看到的）— 16 列
 
 这些字段对标 h1bdata.info，是搜索结果表格里直接展示的。
 
 | # | Column Name | Type | 说明 |
 |---|-------------|------|------|
-| 1 | `CASE_NUMBER` | VARCHAR | 主键，唯一标识 |
-| 2 | `EMPLOYER_NAME` | VARCHAR | 雇主名称（搜索 & 展示核心） |
-| 3 | `JOB_TITLE` | VARCHAR | 职位名称（搜索 & 展示核心） |
-| 4 | `EMPLOYER_CITY` | VARCHAR | 雇主所在城市（公司总部/注册地） |
-| 5 | `EMPLOYER_STATE` | VARCHAR | 雇主所在州（公司总部/注册地） |
-| 6 | `WORKSITE_CITY` | VARCHAR | 实际工作城市（员工上班地点） |
-| 7 | `WORKSITE_STATE` | VARCHAR | 实际工作州（员工上班地点） |
-| 8 | `WAGE_RATE_OF_PAY_FROM` | DECIMAL | 工资下限 |
-| 9 | `WAGE_RATE_OF_PAY_TO` | DECIMAL | 工资上限（NULL = 固定薪资） |
-| 10 | `WAGE_UNIT_OF_PAY` | VARCHAR | 工资单位（Hour/Week/Month/Year），年化计算需要 |
-| 11 | `RECEIVED_DATE` | DATE | 提交日期 |
-| 12 | `BEGIN_DATE` | DATE | 工作开始日期 |
-| 13 | `CASE_STATUS` | VARCHAR | 审批状态（Certified / Denied / Withdrawn 等） |
-| 14 | `FISCAL_YEAR` | INTEGER | 财年（ETL 生成） |
+| 1 | `CASE_NUMBER` | TEXT | 主键，唯一标识 |
+| 2 | `EMPLOYER_NAME` | TEXT | 雇主名称（搜索 & 展示核心） |
+| 3 | `JOB_TITLE` | TEXT | 职位名称（搜索 & 展示核心） |
+| 4 | `EMPLOYER_ADDRESS` | TEXT | 雇主地址（合并 ADDRESS1 + ADDRESS2） |
+| 5 | `EMPLOYER_CITY` | TEXT | 雇主所在城市（公司总部/注册地） |
+| 6 | `EMPLOYER_STATE` | TEXT | 雇主所在州（公司总部/注册地） |
+| 7 | `EMPLOYER_POSTAL_CODE` | TEXT | 雇主邮编 |
+| 8 | `WORKSITE_CITY` | TEXT | 实际工作城市（员工上班地点） |
+| 9 | `WORKSITE_STATE` | TEXT | 实际工作州（员工上班地点） |
+| 10 | `WAGE_RATE_OF_PAY_FROM` | NUMERIC | 工资下限 |
+| 11 | `WAGE_RATE_OF_PAY_TO` | NUMERIC | 工资上限（NULL = 固定薪资） |
+| 12 | `WAGE_UNIT_OF_PAY` | TEXT | 工资单位（Hour/Week/Month/Year），年化计算需要 |
+| 13 | `RECEIVED_DATE` | DATE | 提交日期 |
+| 14 | `BEGIN_DATE` | DATE | 工作开始日期 |
+| 15 | `CASE_STATUS` | TEXT | 审批状态（Certified / Denied / Withdrawn 等） |
+| 16 | `FISCAL_YEAR` | INTEGER | 财年（ETL 生成） |
 
-### B. 差异化分析字段（超越 h1bdata.info 的竞争力）
+### B. 差异化分析字段（超越 h1bdata.info 的竞争力）— 22 列
 
 这些字段是 h1bdata.info **没有** 的，是我们产品的核心差异化。
 
 | # | Column Name | Type | 说明 | 回答的问题 |
 |---|-------------|------|------|-----------|
-| 15 | `VISA_CLASS` | VARCHAR | 签证类型 (H-1B / E-3 / H-1B1) | 区分签证类别 |
-| 16 | `SOC_CODE` | VARCHAR | 标准职业分类代码 | 跨公司、跨地区的职业对比 |
-| 17 | `SOC_TITLE` | VARCHAR | 标准职业名称 | 职业标准化（JOB_TITLE 太自由） |
-| 18 | `FULL_TIME_POSITION` | VARCHAR(1) | 全职/兼职 (Y/N) | Full-time vs Part-time 分析 |
-| 19 | `TOTAL_WORKER_POSITIONS` | INTEGER | 该申请涵盖的工人数 | 某公司实际招多少人 |
-| 20 | `NEW_EMPLOYMENT` | INTEGER | 新雇佣人数 | 区分 new hire vs transfer |
-| 21 | `CONTINUED_EMPLOYMENT` | INTEGER | 续签人数 | 区分 extension |
-| 22 | `CHANGE_EMPLOYER` | INTEGER | 换雇主人数 | 区分 transfer |
-| 23 | `AMENDED_PETITION` | INTEGER | 修改申请人数 | 区分 amendment |
-| 24 | `PREVAILING_WAGE` | DECIMAL | 该地区该职位的市场标准工资 | 公司工资 vs 市场水平 |
-| 25 | `PW_UNIT_OF_PAY` | VARCHAR | Prevailing wage 单位 | 年化计算需要 |
-| 26 | `PW_WAGE_LEVEL` | VARCHAR | 工资等级 (I/II/III/IV) | Level I=入门, IV=资深，反映职位资历 |
-| 27 | `H-1B_DEPENDENT` | VARCHAR(1) | 是否 H-1B Dependent 雇主 (Y/N) | 识别高度依赖 H1B 的公司 |
-| 28 | `WILLFUL_VIOLATOR` | VARCHAR(1) | 是否有过故意违规 (Y/N) | 雇主合规风险 |
-| 29 | `SUPPORT_H1B` | VARCHAR | 是否仅支持免抽签 H1B (Y/N/N/A) | **核心差异化**: 判断 cap-exempt |
-| 30 | `STATUTORY_BASIS` | VARCHAR | 免抽签依据 (Wage/Degree/Both) | 免抽签是因为薪资还是学历 |
-| 31 | `NAICS_CODE` | VARCHAR | 行业分类代码 | 按行业分析 H1B 趋势 |
-| 32 | `SECONDARY_ENTITY` | VARCHAR(1) | 是否第三方派遣 (Y/N) | 识别 staffing/outsourcing |
+| 17 | `VISA_CLASS` | TEXT | 签证类型 (H-1B / E-3 / H-1B1) | 区分签证类别 |
+| 18 | `SOC_CODE` | TEXT | 标准职业分类代码 | 跨公司、跨地区的职业对比 |
+| 19 | `SOC_TITLE` | TEXT | 标准职业名称 | 职业标准化（JOB_TITLE 太自由） |
+| 20 | `FULL_TIME_POSITION` | TEXT | 全职/兼职 (Y/N) | Full-time vs Part-time 分析 |
+| 21 | `TOTAL_WORKER_POSITIONS` | INTEGER | 该申请涵盖的工人数 | 某公司实际招多少人 |
+| 22 | `NEW_EMPLOYMENT` | TEXT | 新雇佣人数 | 区分 new hire vs transfer |
+| 23 | `CONTINUED_EMPLOYMENT` | TEXT | 续签人数 | 区分 extension |
+| 24 | `CHANGE_EMPLOYER` | TEXT | 换雇主人数 | 区分 transfer |
+| 25 | `AMENDED_PETITION` | TEXT | 修改申请人数 | 区分 amendment |
+| 26 | `PREVAILING_WAGE` | NUMERIC | 该地区该职位的市场标准工资 | 公司工资 vs 市场水平 |
+| 27 | `PW_UNIT_OF_PAY` | TEXT | Prevailing wage 单位 | 年化计算需要 |
+| 28 | `PW_WAGE_LEVEL` | TEXT | 工资等级 (I/II/III/IV) | Level I=入门, IV=资深，反映职位资历 |
+| 29 | `H1B_DEPENDENT` | TEXT | 是否 H-1B Dependent 雇主 (Y/N) | 识别高度依赖 H1B 的公司 |
+| 30 | `WILLFUL_VIOLATOR` | TEXT | 是否有过故意违规 (Y/N) | 雇主合规风险 |
+| 31 | `SUPPORT_H1B` | TEXT | 是否仅支持免抽签 H1B (Y/N/N/A) | **核心差异化**: 判断 cap-exempt |
+| 32 | `STATUTORY_BASIS` | TEXT | 免抽签依据 (Wage/Degree/Both) | 免抽签是因为薪资还是学历 |
+| 33 | `NAICS_CODE` | TEXT | 行业分类代码 | 按行业分析 H1B 趋势 |
+| 34 | `SECONDARY_ENTITY` | TEXT | 是否第三方派遣 (Y/N) | 识别 staffing/outsourcing |
+| 35 | `LAWFIRM_NAME_BUSINESS_NAME` | TEXT | 代理律所名称 | 哪些律所在帮哪些公司办 H1B |
+| 36 | `EMPLOYER_POC_NAME` | TEXT | 雇主联系人姓名（合并 FIRST + LAST） | 雇主联系人信息 |
+| 37 | `EMPLOYER_POC_JOB_TITLE` | TEXT | 雇主联系人职位 | 联系人角色（HR / Legal 等） |
+| 38 | `EMPLOYER_POC_EMAIL` | TEXT | 雇主联系人邮箱 | 联系渠道 |
 
-### C. 砍掉的字段（66 列）及理由
+### C. 附加表
+
+除了每个 fiscal year 一张表（`refined.fy2020` ~ `refined.fy2026`），还有两张附加表：
+
+#### `refined.fy_all` — 全量表
+
+所有 fiscal year 的 UNION ALL，用于跨年分析：
+- **3,514,878 行**（= 所有 FY 表的总和）
+- 同一个 case_number 可能出现在多个 fiscal year 中（跨年 LCA 正常现象）
+- 3,412,794 个 distinct case_number，102,084 个跨年重复
+
+#### `refined.employers` — 雇主维度表
+
+从 `fy_all` 聚合得到的雇主维度表，每个 employer_name 一行：
+
+| Column | Type | 说明 |
+|--------|------|------|
+| `employer_name` | TEXT | 雇主名称（主键） |
+| `employer_address` | TEXT | 最新地址 |
+| `employer_city` | TEXT | 最新城市 |
+| `employer_state` | TEXT | 最新州 |
+| `employer_postal_code` | TEXT | 最新邮编 |
+| `naics_code` | TEXT | 最新 NAICS 行业代码 |
+| `h1b_dependent` | TEXT | 最新 H-1B Dependent 标记 |
+| `willful_violator` | TEXT | 最新 Willful Violator 标记 |
+| `total_applications` | INTEGER | 总申请数（跨所有年份） |
+| `first_seen_year` | INTEGER | 最早出现的 fiscal year |
+| `last_seen_year` | INTEGER | 最近出现的 fiscal year |
+
+**统计**：214,366 个唯一雇主，Top 10 申请量最大的雇主：
+
+| 雇主 | 总部 | 总申请数 |
+|------|------|---------|
+| COGNIZANT TECHNOLOGY SOLUTIONS US CORP | College Station, TX | 92,357 |
+| Amazon.com Services LLC | Seattle, WA | 60,910 |
+| Ernst & Young U.S. LLP | Secaucus, NJ | 57,336 |
+| Google LLC | Mountain View, CA | 56,672 |
+| Microsoft Corporation | Redmond, WA | 54,619 |
+| INFOSYS LIMITED | Richardson, TX | 42,545 |
+| TATA CONSULTANCY SERVICES LIMITED | Rockville, MD | 38,159 |
+| Apple Inc. | Cupertino, CA | 29,147 |
+| Accenture LLP | Chicago, IL | 22,672 |
+| Deloitte Consulting LLP | Philadelphia, PA | 21,988 |
+
+### D. 砍掉的字段（63 列）及理由
 
 | 砍掉的类别 | 列数 | 理由 |
 |-----------|------|------|
-| Employer POC 联系人 (33-46) | 14 | 个人联系信息，对终端用户无分析价值 |
+| Employer POC 其余字段 (35, 37-43, 45) | 9 | 保留了姓名（合并）、职位、邮箱；砍掉 middle name、地址、省份、电话等 |
 | Agent/Attorney 信息 (47-60) | 14 | 律师联系方式，非核心业务问题 |
 | Preparer 信息 (94-98) | 5 | 表格填写人信息，无分析价值 |
-| Employer 详细地址 (22-23, 26-28, 30) | 5 | 保留了 CITY/STATE，砍掉 ADDRESS1/2, POSTAL_CODE, COUNTRY, PROVINCE |
-| Law Firm 信息 (61-64) | 4 | 律所名称/FEIN/法院信息，非核心 |
+| Employer 其余地址字段 (27-28, 30) | 3 | 保留了 ADDRESS(合并)、CITY、STATE、POSTAL_CODE；砍掉 COUNTRY、PROVINCE、PHONE |
+| Law Firm 其余字段 (62-64) | 3 | 保留了律所名称；砍掉 FEIN、法院信息 |
 | Worksite 详细地址 (68-69, 73) | 3 | 只保留 city/state，详细街道无需 |
-| PW 详细来源 (79, 82-85) | 5 | Prevailing wage 追踪号和调查来源，太细节 |
+| PW 详细来源 (79, 82-85) | 5 | Prevailing wage 追踪号和调查来源（见下方说明） |
 | 合规声明 & 披露 (87, 92-93) | 3 | 几乎所有记录都是 Y，无分析价值 |
-| 其他低价值 (21, 29, 31, 62, 71, 75, 81, 86 等) | 13 | TRADE_NAME_DBA / EMPLOYER_PHONE / EMPLOYER_FEIN 等 |
+| 其他低价值 (21, 29-31, 65, 71, 81, 86 等) | 14 | TRADE_NAME_DBA / EMPLOYER_PHONE / EMPLOYER_FEIN 等 |
+| POC 电话 (44) | 1 | 电话号码对终端用户分析价值低，邮箱已足够 |
+| 合并消除 (33+34→POC_NAME, 22+23→ADDRESS) | 3 | 原始 5 列合并为 2 列，净减 3 列 |
+
+**PW 详细来源说明**：Prevailing Wage（市场标准工资）可以来自不同的数据源。`PW_TRACKING_NUMBER` 是 DOL 发放的工资认定追踪号；`PW_OTHER_SOURCE` 标记是来自 CBA（集体谈判协议）、DBA（Davis-Bacon Act）、SCA（Service Contract Act）还是第三方调查；`PW_SURVEY_PUBLISHER/NAME` 是第三方调查的出版商和调查名称；`PW_OES_YEAR/PW_OTHER_YEAR` 是调查的年份。这些字段过于细节，我们只保留了 `PREVAILING_WAGE`（金额）、`PW_UNIT_OF_PAY`（单位）和 `PW_WAGE_LEVEL`（等级 I-IV）这三个最有分析价值的字段。
 
 > **注意**: `WORKSITE_COUNTY` (col 71) 和 `END_DATE` (col 12) 作为候选保留项，如果未来需要更细粒度的地理分析或签证有效期分析可以加回。
+
+---
+
+## JOB_TITLE 跨年度一致性验证
+
+`JOB_TITLE` 是分析的核心字段。经验证，该字段在所有年份中保持一致：
+
+| 年份 | 字段名 | 备注 |
+|------|--------|------|
+| FY2018 (iCERT Legacy) | `JOB_TITLE` | 字段名一致，无需 mapping |
+| FY2019 (iCERT Expanded) | `JOB_TITLE` | 字段名一致，无需 mapping |
+| FY2020 ~ FY2026 (FLAG) | `JOB_TITLE` | 字段名一致 |
+
+> **注意**: `JOB_TITLE` 是自由文本字段（free-text），同一职位可能有不同写法（如 "Software Engineer" vs "SOFTWARE ENGINEER" vs "Sr. Software Engineer"）。建议在 ETL 层做 `UPPER(TRIM(JOB_TITLE))` 标准化。对于标准化的职业分析，应优先使用 `SOC_CODE` + `SOC_TITLE`（标准职业分类），`JOB_TITLE` 作为更细粒度的补充。
 
 ---
 
@@ -173,7 +252,8 @@ END
 
 | 维度 | h1bdata.info | 我们的产品 |
 |------|-------------|-----------|
-| 字段数 | 6 | 32 + 6 衍生字段 |
+| 字段数 | 6 | 38 + 6 衍生字段 |
+| 数据量 | 未知 | 3,514,878 行，214,366 个雇主 |
 | 工资分析 | 只有 base salary | 工资 + prevailing wage + 差值百分比 + 工资等级 |
 | 免抽签分析 | 无 | SUPPORT_H1B + STATUTORY_BASIS + NAICS 推断 |
 | 申请类型 | 无 | New / Transfer / Extension / Amendment |
@@ -182,55 +262,64 @@ END
 | H-1B Dependent | 无 | 标记高度依赖 H1B 的雇主 |
 | 合规风险 | 无 | Willful Violator 标记 |
 | 第三方派遣 | 无 | Secondary Entity 标记 |
-| 雇主地理 | 无 | EMPLOYER_CITY/STATE（公司总部 vs 工作地点对比） |
-| 搜索维度 | 公司 / 职位 / 城市 / 年份 | 公司 / 职位 / 城市 / 年份 / SOC / 行业 / 签证类型 / 雇主所在地 |
+| 雇主地理 | 无 | EMPLOYER_ADDRESS/CITY/STATE/POSTAL_CODE（完整地址 + 工作地点对比） |
+| 代理律所 | 无 | LAWFIRM_NAME_BUSINESS_NAME |
+| 雇主联系人 | 无 | POC 姓名（合并）、职位、邮箱 |
+| 雇主维度表 | 无 | `refined.employers`：214,366 个雇主聚合信息 |
+| 搜索维度 | 公司 / 职位 / 城市 / 年份 | 公司 / 职位 / 城市 / 邮编 / 年份 / SOC / 行业 / 签证类型 / 雇主所在地 |
 
 ---
 
-## Appendix A: 完整保留字段清单 (32 columns)
+## Appendix A: 完整保留字段清单 (38 columns)
 
-以下是从原始 99 列（98 原始 + 1 ETL）中保留的 32 列完整清单。
+以下是 refined 层的 38 列完整清单。带 `*` 的为合并字段。
 
-| # | Column Name | 原始序号 | Type | 分类 |
-|---|-------------|---------|------|------|
-| 1 | `CASE_NUMBER` | 1 | VARCHAR | 核心展示 |
-| 2 | `EMPLOYER_NAME` | 20 | VARCHAR | 核心展示 |
-| 3 | `JOB_TITLE` | 7 | VARCHAR | 核心展示 |
-| 4 | `EMPLOYER_CITY` | 24 | VARCHAR | 核心展示 |
-| 5 | `EMPLOYER_STATE` | 25 | VARCHAR | 核心展示 |
-| 6 | `WORKSITE_CITY` | 70 | VARCHAR | 核心展示 |
-| 7 | `WORKSITE_STATE` | 72 | VARCHAR | 核心展示 |
-| 8 | `WAGE_RATE_OF_PAY_FROM` | 74 | DECIMAL | 核心展示 |
-| 9 | `WAGE_RATE_OF_PAY_TO` | 75 | DECIMAL | 核心展示 |
-| 10 | `WAGE_UNIT_OF_PAY` | 76 | VARCHAR | 核心展示 |
-| 11 | `RECEIVED_DATE` | 3 | DATE | 核心展示 |
-| 12 | `BEGIN_DATE` | 11 | DATE | 核心展示 |
-| 13 | `CASE_STATUS` | 2 | VARCHAR | 核心展示 |
-| 14 | `FISCAL_YEAR` | 99 (ETL) | INTEGER | 核心展示 |
-| 15 | `VISA_CLASS` | 6 | VARCHAR | 差异化分析 |
-| 16 | `SOC_CODE` | 8 | VARCHAR | 差异化分析 |
-| 17 | `SOC_TITLE` | 9 | VARCHAR | 差异化分析 |
-| 18 | `FULL_TIME_POSITION` | 10 | VARCHAR(1) | 差异化分析 |
-| 19 | `TOTAL_WORKER_POSITIONS` | 13 | INTEGER | 差异化分析 |
-| 20 | `NEW_EMPLOYMENT` | 14 | INTEGER | 差异化分析 |
-| 21 | `CONTINUED_EMPLOYMENT` | 15 | INTEGER | 差异化分析 |
-| 22 | `CHANGE_EMPLOYER` | 18 | INTEGER | 差异化分析 |
-| 23 | `AMENDED_PETITION` | 19 | INTEGER | 差异化分析 |
-| 24 | `PREVAILING_WAGE` | 77 | DECIMAL | 差异化分析 |
-| 25 | `PW_UNIT_OF_PAY` | 78 | VARCHAR | 差异化分析 |
-| 26 | `PW_WAGE_LEVEL` | 80 | VARCHAR | 差异化分析 |
-| 27 | `H-1B_DEPENDENT` | 88 | VARCHAR(1) | 差异化分析 |
-| 28 | `WILLFUL_VIOLATOR` | 89 | VARCHAR(1) | 差异化分析 |
-| 29 | `SUPPORT_H1B` | 90 | VARCHAR | 差异化分析 |
-| 30 | `STATUTORY_BASIS` | 91 | VARCHAR | 差异化分析 |
-| 31 | `NAICS_CODE` | 32 | VARCHAR | 差异化分析 |
-| 32 | `SECONDARY_ENTITY` | 66 | VARCHAR(1) | 差异化分析 |
+| # | Column Name | 来源 | Type | 分类 |
+|---|-------------|------|------|------|
+| 1 | `CASE_NUMBER` | col 1 | TEXT | 核心展示 |
+| 2 | `EMPLOYER_NAME` | col 20 | TEXT | 核心展示 |
+| 3 | `JOB_TITLE` | col 7 | TEXT | 核心展示 |
+| 4 | `EMPLOYER_ADDRESS` * | col 22 + 23 合并 | TEXT | 核心展示 |
+| 5 | `EMPLOYER_CITY` | col 24 | TEXT | 核心展示 |
+| 6 | `EMPLOYER_STATE` | col 25 | TEXT | 核心展示 |
+| 7 | `EMPLOYER_POSTAL_CODE` | col 26 | TEXT | 核心展示 |
+| 8 | `WORKSITE_CITY` | col 70 | TEXT | 核心展示 |
+| 9 | `WORKSITE_STATE` | col 72 | TEXT | 核心展示 |
+| 10 | `WAGE_RATE_OF_PAY_FROM` | col 74 | NUMERIC | 核心展示 |
+| 11 | `WAGE_RATE_OF_PAY_TO` | col 75 | NUMERIC | 核心展示 |
+| 12 | `WAGE_UNIT_OF_PAY` | col 76 | TEXT | 核心展示 |
+| 13 | `RECEIVED_DATE` | col 3 | DATE | 核心展示 |
+| 14 | `BEGIN_DATE` | col 11 | DATE | 核心展示 |
+| 15 | `CASE_STATUS` | col 2 | TEXT | 核心展示 |
+| 16 | `FISCAL_YEAR` | ETL 生成 | INTEGER | 核心展示 |
+| 17 | `VISA_CLASS` | col 6 | TEXT | 差异化分析 |
+| 18 | `SOC_CODE` | col 8 | TEXT | 差异化分析 |
+| 19 | `SOC_TITLE` | col 9 | TEXT | 差异化分析 |
+| 20 | `FULL_TIME_POSITION` | col 10 | TEXT | 差异化分析 |
+| 21 | `TOTAL_WORKER_POSITIONS` | col 13 | INTEGER | 差异化分析 |
+| 22 | `NEW_EMPLOYMENT` | col 14 | TEXT | 差异化分析 |
+| 23 | `CONTINUED_EMPLOYMENT` | col 15 | TEXT | 差异化分析 |
+| 24 | `CHANGE_EMPLOYER` | col 18 | TEXT | 差异化分析 |
+| 25 | `AMENDED_PETITION` | col 19 | TEXT | 差异化分析 |
+| 26 | `PREVAILING_WAGE` | col 77 | NUMERIC | 差异化分析 |
+| 27 | `PW_UNIT_OF_PAY` | col 78 | TEXT | 差异化分析 |
+| 28 | `PW_WAGE_LEVEL` | col 80 | TEXT | 差异化分析 |
+| 29 | `H1B_DEPENDENT` | col 88 | TEXT | 差异化分析 |
+| 30 | `WILLFUL_VIOLATOR` | col 89 | TEXT | 差异化分析 |
+| 31 | `SUPPORT_H1B` | col 90 | TEXT | 差异化分析 |
+| 32 | `STATUTORY_BASIS` | col 91 | TEXT | 差异化分析 |
+| 33 | `NAICS_CODE` | col 32 | TEXT | 差异化分析 |
+| 34 | `SECONDARY_ENTITY` | col 66 | TEXT | 差异化分析 |
+| 35 | `LAWFIRM_NAME_BUSINESS_NAME` | col 61 | TEXT | 差异化分析 |
+| 36 | `EMPLOYER_POC_NAME` * | col 34 + 33 合并 | TEXT | 雇主联系人 |
+| 37 | `EMPLOYER_POC_JOB_TITLE` | col 36 | TEXT | 雇主联系人 |
+| 38 | `EMPLOYER_POC_EMAIL` | col 46 | TEXT | 雇主联系人 |
 
 ---
 
-## Appendix B: 完整排除字段清单 (67 columns)
+## Appendix B: 完整排除字段清单 (61 columns)
 
-以下是被排除的 67 列，按原始 schema 分组，附排除理由。
+以下是被排除的 61 列，按原始 schema 分组，附排除理由。
 
 ### Case Information（排除 3 列）
 
@@ -247,38 +336,35 @@ END
 | 16 | `CHANGE_PREVIOUS_EMPLOYMENT` | 细分类型，与 CONTINUED_EMPLOYMENT 重叠，使用频率低 |
 | 17 | `NEW_CONCURRENT_EMPLOYMENT` | 并发雇佣，属于边缘场景，使用频率低 |
 
-### Employer Information（排除 7 列）
+### Employer Information（排除 6 列，保留了 4 列 → 合并为 3 列）
+
+已保留: `EMPLOYER_ADDRESS` (合并 #22+#23), `EMPLOYER_CITY` (#24), `EMPLOYER_STATE` (#25), `EMPLOYER_POSTAL_CODE` (#26)
 
 | 原始序号 | Column Name | 排除理由 |
 |---------|-------------|---------|
 | 21 | `TRADE_NAME_DBA` | DBA 名称，绝大部分为 NULL，有 EMPLOYER_NAME 足够 |
-| 22 | `EMPLOYER_ADDRESS1` | 详细街道地址，粒度太细，保留了 CITY/STATE |
-| 23 | `EMPLOYER_ADDRESS2` | 地址第二行，绝大部分为 NULL |
-| 26 | `EMPLOYER_POSTAL_CODE` | 邮编，有 CITY/STATE 足够定位 |
 | 27 | `EMPLOYER_COUNTRY` | 几乎全部为 "UNITED STATES OF AMERICA"，信息量低 |
 | 28 | `EMPLOYER_PROVINCE` | 仅非美国雇主有值，极少数记录 |
 | 29 | `EMPLOYER_PHONE` | 电话号码，对终端用户无分析价值 |
 | 30 | `EMPLOYER_PHONE_EXT` | 分机号，对终端用户无分析价值 |
 | 31 | `EMPLOYER_FEIN` | 联邦雇主识别号（PII），FY2024 Q4 前全部为 NULL |
 
-### Employer POC（排除 14 列）
+### Employer POC（排除 11 列，保留了 3 列）
+
+已保留: `EMPLOYER_POC_NAME` (合并 #33+#34), `EMPLOYER_POC_JOB_TITLE` (#36), `EMPLOYER_POC_EMAIL` (#46)
 
 | 原始序号 | Column Name | 排除理由 |
 |---------|-------------|---------|
-| 33 | `EMPLOYER_POC_LAST_NAME` | 个人联系信息，无分析价值 |
-| 34 | `EMPLOYER_POC_FIRST_NAME` | 同上 |
-| 35 | `EMPLOYER_POC_MIDDLE_NAME` | 同上 |
-| 36 | `EMPLOYER_POC_JOB_TITLE` | 同上 |
-| 37 | `EMPLOYER_POC_ADDRESS1` | 同上 |
+| 35 | `EMPLOYER_POC_MIDDLE_NAME` | Middle name 对联系人识别价值低 |
+| 37 | `EMPLOYER_POC_ADDRESS1` | POC 地址，有雇主地址足够 |
 | 38 | `EMPLOYER_POC_ADDRESS2` | 同上 |
 | 39 | `EMPLOYER_POC_CITY` | 同上 |
 | 40 | `EMPLOYER_POC_STATE` | 同上 |
 | 41 | `EMPLOYER_POC_POSTAL_CODE` | 同上 |
 | 42 | `EMPLOYER_POC_COUNTRY` | 同上 |
 | 43 | `EMPLOYER_POC_PROVINCE` | 同上 |
-| 44 | `EMPLOYER_POC_PHONE` | 同上 |
-| 45 | `EMPLOYER_POC_PHONE_EXT` | 同上 |
-| 46 | `EMPLOYER_POC_EMAIL` | 同上 |
+| 44 | `EMPLOYER_POC_PHONE` | 电话号码，有邮箱已足够联系 |
+| 45 | `EMPLOYER_POC_PHONE_EXT` | 分机号 |
 
 ### Agent / Attorney（排除 14 列）
 
@@ -299,16 +385,17 @@ END
 | 59 | `AGENT_ATTORNEY_PHONE_EXT` | 同上 |
 | 60 | `AGENT_ATTORNEY_EMAIL_ADDRESS` | 同上 |
 
-### Law Firm & Court（排除 4 列）
+### Law Firm & Court（排除 3 列，保留了 1 列）
+
+已保留: `LAWFIRM_NAME_BUSINESS_NAME` (#61)
 
 | 原始序号 | Column Name | 排除理由 |
 |---------|-------------|---------|
-| 61 | `LAWFIRM_NAME_BUSINESS_NAME` | 律所名称，非核心分析维度 |
 | 62 | `LAWFIRM_BUSINESS_FEIN` | 律所 FEIN，FY2025 Q4 前全部为 NULL |
 | 63 | `STATE_OF_HIGHEST_COURT` | 律师执照信息，无分析价值 |
 | 64 | `NAME_OF_HIGHEST_STATE_COURT` | 同上 |
 
-### Worksite Information（排除 4 列）
+### Worksite Information（排除 6 列）
 
 | 原始序号 | Column Name | 排除理由 |
 |---------|-------------|---------|
@@ -357,14 +444,16 @@ END
 |------|---------|
 | Case Information | 3 |
 | Worker Counts | 2 |
-| Employer Information | 9 |
-| Employer POC | 14 |
+| Employer Information | 6 |
+| Employer POC | 11 |
 | Agent / Attorney | 14 |
-| Law Firm & Court | 4 |
+| Law Firm & Court | 3 |
 | Worksite Information | 6 |
 | Wage - PW Details | 6 |
 | Compliance & Disclosure | 4 |
 | Preparer Information | 5 |
-| **总计** | **67** |
+| **总计** | **60** |
 
-> **保留 32 列 + 排除 67 列 = 99 列**（原始 98 列 + 1 ETL 列 `FISCAL_YEAR`）
+> **来源**: 98 原始列 + 1 ETL 列 (`source_table`) = 99 列
+> **保留**: 40 列（其中 3 对合并为 2 → 净 38 列）+ 1 新增 (`FISCAL_YEAR`)
+> **排除**: 60 列（不含 `source_table`，refined 层不需要 lineage）

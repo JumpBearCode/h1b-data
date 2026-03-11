@@ -1,2 +1,6 @@
 PDF/
 logs/
+.env
+Raw_CSV/
+__pycache__/
+*.pyc

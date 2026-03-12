@@ -1,326 +1,635 @@
 """
-Employer name normalization and fuzzy matching.
+Employer name normalization pipeline.
 
-Two-step approach:
-  Step 1: Deterministic normalization (UPPER + strip suffixes/punctuation)
-  Step 2: Trigram similarity matching with blocking (pg_trgm)
+Extracts all distinct employer names from refined.fy_all,
+applies Python-based canonicalization, and writes results to
+refined.employer_name_lookup (raw_name, normalized_name).
 
-Adds `employer_name_normalized` column to refined.employers and
-creates refined.employer_match_candidates for fuzzy match review.
+Normalization steps:
+  1. Lowercase + strip whitespace
+  2. Remove legal suffixes (via cleanco + custom rules)
+  3. Expand common abbreviations (& → and, svc → services, etc.)
+  4. Remove all punctuation
+  5. Collapse whitespace
+  6. Sort tokens alphabetically (for order-invariant matching)
 
 Usage:
     uv run python src/employer_normalization.py
 """
 
 import os
+import re
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from cleanco import basename
 from src.db_connector import get_h1b_connection
 
 
-def step1_deterministic_normalization(conn):
-    """
-    Step 1: Add employer_name_normalized column with deterministic cleaning.
+# ---------------------------------------------------------------------------
+# Normalization rules
+# ---------------------------------------------------------------------------
 
-    Rules:
-      1. UPPER()
-      2. Remove common legal suffixes (LLC, INC, CORP, etc.)
-      3. Remove punctuation (commas, periods, quotes, dashes)
-      4. Collapse multiple spaces
-      5. TRIM
+# Legal suffixes to strip (beyond what cleanco handles).
+# Applied AFTER cleanco, which catches most international forms.
+# These catch edge cases and abbreviations cleanco may miss.
+LEGAL_SUFFIXES = re.compile(
+    r'\b('
+    r'incorporated|corporation|professional corporation|'
+    r'limited liability company|limited liability partnership|'
+    r'limited partnership|limited|'
+    r'l\.?l\.?c\.?|l\.?l\.?p\.?|l\.?p\.?|'
+    r'inc\.?|corp\.?|co\.?|ltd\.?|p\.?c\.?|p\.?a\.?|'
+    r'd/?b/?a'
+    r')\s*$',
+    re.IGNORECASE
+)
+
+# Pattern to split concatenated suffixes like "SERVICESLIMITED" -> "SERVICES LIMITED"
+GLUED_SUFFIX = re.compile(
+    r'(LIMITED|INCORPORATED|CORPORATION|COMPANY)$',
+    re.IGNORECASE
+)
+
+# Common abbreviations to expand (order matters: longer patterns first)
+ABBREVIATIONS = [
+    (re.compile(r'\b&\b'), ' and '),
+    (re.compile(r'\bsvcs?\b', re.IGNORECASE), 'services'),
+    (re.compile(r'\btech\b', re.IGNORECASE), 'technology'),
+    (re.compile(r'\btechs\b', re.IGNORECASE), 'technologies'),
+    (re.compile(r'\bintl\b', re.IGNORECASE), 'international'),
+    (re.compile(r'\bnatl\b', re.IGNORECASE), 'national'),
+    (re.compile(r'\bmgmt\b', re.IGNORECASE), 'management'),
+    (re.compile(r'\bmfg\b', re.IGNORECASE), 'manufacturing'),
+    (re.compile(r'\bengr\b', re.IGNORECASE), 'engineering'),
+    (re.compile(r'\beng\b', re.IGNORECASE), 'engineering'),
+    (re.compile(r'\bsys\b', re.IGNORECASE), 'systems'),
+    (re.compile(r'\bsoln?s?\b', re.IGNORECASE), 'solutions'),
+    (re.compile(r'\binfo\b', re.IGNORECASE), 'information'),
+    (re.compile(r'\bassoc\b', re.IGNORECASE), 'associates'),
+    (re.compile(r'\buniv\b', re.IGNORECASE), 'university'),
+    (re.compile(r'\bhosp\b', re.IGNORECASE), 'hospital'),
+    (re.compile(r'\bmed\b', re.IGNORECASE), 'medical'),
+    (re.compile(r'\bctr\b', re.IGNORECASE), 'center'),
+    (re.compile(r'\bctrs\b', re.IGNORECASE), 'centers'),
+    (re.compile(r'\bgvt\b', re.IGNORECASE), 'government'),
+    (re.compile(r'\bgov\b', re.IGNORECASE), 'government'),
+    (re.compile(r'\bdev\b', re.IGNORECASE), 'development'),
+    (re.compile(r'\bcomm\b', re.IGNORECASE), 'communications'),
+    (re.compile(r'\bfin\b', re.IGNORECASE), 'financial'),
+    (re.compile(r'\bpharm\b', re.IGNORECASE), 'pharmaceutical'),
+    (re.compile(r'\blab\b', re.IGNORECASE), 'laboratory'),
+    (re.compile(r'\blabs\b', re.IGNORECASE), 'laboratories'),
+    (re.compile(r'\bamer\b', re.IGNORECASE), 'america'),
+    (re.compile(r'\bconsltg\b', re.IGNORECASE), 'consulting'),
+]
+
+# Punctuation pattern: everything that is not alphanumeric or whitespace
+PUNCTUATION = re.compile(r'[^a-z0-9\s]')
+
+# Multiple whitespace
+MULTI_SPACE = re.compile(r'\s+')
+
+
+def normalize_employer_name(raw_name: str) -> str:
     """
+    Apply full canonicalization pipeline to a single employer name.
+
+    Returns lowercase, suffix-stripped, abbreviation-expanded,
+    punctuation-free, token-sorted string.
+    """
+    if not raw_name:
+        return ''
+
+    name = raw_name.strip()
+
+    # Step 0: split concatenated suffixes like "SERVICESLIMITED"
+    name = GLUED_SUFFIX.sub(lambda m: ' ' + m.group(1), name)
+
+    # Step 1: cleanco strips legal suffixes (handles international forms too)
+    cleaned = basename(name)
+    # If cleanco returns empty, fall back to original (happens with short names like SCA, SHA)
+    if not cleaned.strip():
+        cleaned = name
+    name = cleaned
+
+    # Step 2: lowercase
+    name = name.lower()
+
+    # Step 3: strip remaining legal suffixes our regex catches
+    # Apply up to 2 times to catch stacked suffixes like "... Inc Corp"
+    for _ in range(2):
+        prev = name
+        name = LEGAL_SUFFIXES.sub('', name).strip()
+        # Don't allow stripping to empty
+        if not name:
+            name = prev
+            break
+        if name == prev:
+            break
+
+    # Step 4: expand abbreviations
+    for pattern, replacement in ABBREVIATIONS:
+        name = pattern.sub(replacement, name)
+
+    # Step 5: remove all punctuation (replace with space to not merge words)
+    name = PUNCTUATION.sub(' ', name)
+
+    # Step 6: collapse whitespace and trim
+    name = MULTI_SPACE.sub(' ', name).strip()
+
+    # Step 7: sort tokens for order-invariant matching
+    tokens = name.split()
+    name = ' '.join(sorted(tokens))
+
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+def extract_distinct_names(conn):
+    """Extract all distinct employer_name values from refined.fy_all."""
     print("=" * 70)
-    print("STEP 1: Deterministic Normalization")
+    print("STEP 1: Extract distinct employer names from refined.fy_all")
     print("=" * 70)
 
     start = time.time()
-
     with conn.cursor() as cur:
-        # Add column if not exists
-        cur.execute("""
-            ALTER TABLE refined.employers
-            ADD COLUMN IF NOT EXISTS employer_name_normalized TEXT
-        """)
-        conn.commit()
+        cur.execute("SELECT DISTINCT employer_name FROM refined.fy_all ORDER BY employer_name")
+        names = [row[0] for row in cur.fetchall()]
 
-        # Normalize: UPPER -> strip suffixes -> strip punctuation -> collapse spaces
+    elapsed = time.time() - start
+    print(f"    Extracted {len(names):,} distinct employer names ({elapsed:.1f}s)")
+    return names
+
+
+def normalize_all(names):
+    """Apply normalization to all names. Returns list of (raw, normalized) tuples."""
+    print("\n" + "=" * 70)
+    print("STEP 2: Normalize employer names (Python-side)")
+    print("=" * 70)
+
+    start = time.time()
+    results = []
+    for i, raw in enumerate(names):
+        normalized = normalize_employer_name(raw)
+        results.append((raw, normalized))
+        if (i + 1) % 50000 == 0:
+            print(f"    Processed {i + 1:,} / {len(names):,}...")
+
+    elapsed = time.time() - start
+    print(f"    Normalized {len(results):,} names ({elapsed:.1f}s)")
+
+    # Stats
+    distinct_normalized = len(set(r[1] for r in results))
+    collapsed = len(results) - distinct_normalized
+    pct = collapsed / len(results) * 100 if results else 0
+    print(f"\n    Original distinct names:          {len(results):,}")
+    print(f"    Distinct after normalization:     {distinct_normalized:,}")
+    print(f"    Collapsed (exact match):          {collapsed:,} ({pct:.1f}%)")
+
+    return results
+
+
+def write_to_db(conn, results):
+    """Write results to refined.employer_name_lookup table."""
+    print("\n" + "=" * 70)
+    print("STEP 3: Write to refined.employer_name_lookup")
+    print("=" * 70)
+
+    start = time.time()
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS refined.employer_name_lookup")
         cur.execute("""
-            UPDATE refined.employers
-            SET employer_name_normalized = (
-                SELECT
-                    -- Final trim and collapse spaces
-                    TRIM(REGEXP_REPLACE(
-                        -- Strip punctuation: commas, periods, quotes, dashes, parens, slashes
-                        REGEXP_REPLACE(
-                            -- Strip common legal suffixes (order matters: longer first)
-                            REGEXP_REPLACE(
-                                UPPER(TRIM(employer_name)),
-                                -- Anchored at end, optional preceding comma/space
-                                '[\s,]*(INCORPORATED|CORPORATION|PROFESSIONAL CORPORATION|' ||
-                                'LIMITED LIABILITY COMPANY|LIMITED LIABILITY PARTNERSHIP|' ||
-                                'LIMITED PARTNERSHIP|LIMITED|' ||
-                                'L\.?L\.?C\.?|L\.?L\.?P\.?|L\.?P\.?|' ||
-                                'INC\.?|CORP\.?|CO\.?|P\.?C\.?|P\.?A\.?|' ||
-                                'D/?B/?A)\s*$',
-                                '',
-                                'g'
-                            ),
-                            -- Remove: , . " '' ` - () /
-                            '[,\."''`\-\(\)/]',
-                            ' ',
-                            'g'
-                        ),
-                        -- Collapse multiple spaces into one
-                        '\s{2,}',
-                        ' ',
-                        'g'
-                    ))
+            CREATE TABLE refined.employer_name_lookup (
+                raw_name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL
             )
         """)
         conn.commit()
 
-        # Stats: how many distinct normalized names vs original
-        cur.execute("SELECT COUNT(*) FROM refined.employers")
-        total_original = cur.fetchone()[0]
+        # Batch insert using execute_values for speed
+        from psycopg2.extras import execute_values
+        batch_size = 10000
+        for i in range(0, len(results), batch_size):
+            batch = results[i:i + batch_size]
+            execute_values(
+                cur,
+                "INSERT INTO refined.employer_name_lookup (raw_name, normalized_name) VALUES %s",
+                batch,
+                page_size=batch_size
+            )
+            if (i + batch_size) % 50000 == 0 or i + batch_size >= len(results):
+                conn.commit()
+                print(f"    Inserted {min(i + batch_size, len(results)):,} / {len(results):,}...")
 
-        cur.execute("SELECT COUNT(DISTINCT employer_name_normalized) FROM refined.employers")
-        total_normalized = cur.fetchone()[0]
+        conn.commit()
 
-        reduced = total_original - total_normalized
-        pct = reduced / total_original * 100 if total_original > 0 else 0
+        # Create indexes
+        print("    Creating indexes...")
+        cur.execute("CREATE INDEX idx_enl_raw ON refined.employer_name_lookup (raw_name)")
+        cur.execute("CREATE INDEX idx_enl_norm ON refined.employer_name_lookup (normalized_name)")
+        conn.commit()
 
     elapsed = time.time() - start
-    print("\n    Original distinct employer_name:    {:,}".format(total_original))
-    print("    After normalization (distinct):     {:,}".format(total_normalized))
-    print("    Collapsed (exact match after norm): {:,} ({:.1f}%)".format(reduced, pct))
-    print("    Time: {:.1f}s".format(elapsed))
+    print(f"    Done ({elapsed:.1f}s)")
 
-    # Show examples of collapsed groups
-    print("\n    Top 20 normalized groups (most variants collapsed):")
+
+def evaluate(conn, results):
+    """Print evaluation metrics and sample groups."""
+    print("\n" + "=" * 70)
+    print("EVALUATION")
+    print("=" * 70)
+
+    # Build a mapping: normalized -> list of raw names
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for raw, norm in results:
+        groups[norm].append(raw)
+
+    # Multi-variant groups (where normalization actually merged something)
+    multi = {k: v for k, v in groups.items() if len(v) > 1}
+    multi_sorted = sorted(multi.items(), key=lambda x: len(x[1]), reverse=True)
+
+    print(f"\n    Total groups (distinct normalized names): {len(groups):,}")
+    print(f"    Groups with 1 member (already unique):    {len(groups) - len(multi):,}")
+    print(f"    Groups with 2+ members (collapsed):       {len(multi):,}")
+
+    # Distribution of group sizes
+    from collections import Counter
+    size_dist = Counter(len(v) for v in groups.values())
+    print("\n    Distribution of group sizes:")
+    for size in sorted(size_dist.keys()):
+        cnt = size_dist[size]
+        if size == 1:
+            print(f"        {size} member:   {cnt:,} groups")
+        else:
+            print(f"        {size} members:  {cnt:,} groups")
+        if size > 10:
+            break
+
+    # Top 30 groups by number of variants
+    print("\n    Top 30 groups (most variants collapsed):")
+    for norm, variants in multi_sorted[:30]:
+        print(f"\n        [{norm}] — {len(variants)} variants:")
+        for v in sorted(variants)[:8]:
+            print(f"            - {v}")
+        if len(variants) > 8:
+            print(f"            ... and {len(variants) - 8} more")
+
+    # Spot-check well-known companies
+    print("\n    Spot-check: well-known companies:")
+    checks = ['amazon', 'google', 'meta', 'microsoft', 'apple', 'tata', 'ibm',
+              'deloitte', 'ernst', 'infosys', 'wipro', 'cognizant']
+    for check in checks:
+        matching = [(norm, variants) for norm, variants in groups.items()
+                    if check in norm]
+        if matching:
+            for norm, variants in sorted(matching, key=lambda x: len(x[1]), reverse=True)[:3]:
+                print(f"\n        [{norm}] — {len(variants)} variants:")
+                for v in sorted(variants)[:5]:
+                    print(f"            - {v}")
+                if len(variants) > 5:
+                    print(f"            ... and {len(variants) - 5} more")
+
+    # Verify DB contents
+    print("\n    Verifying database table:")
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT employer_name_normalized,
-                   COUNT(*) AS cnt,
-                   SUM(total_applications) AS total_apps,
-                   array_agg(employer_name ORDER BY total_applications DESC) AS variants
-            FROM refined.employers
-            GROUP BY employer_name_normalized
-            HAVING COUNT(*) > 1
-            ORDER BY SUM(total_applications) DESC
-            LIMIT 20
-        """)
-        for row in cur.fetchall():
-            norm_name, cnt, total_apps, variants = row
-            print("\n        [{}] {:,} apps, {} variants:".format(norm_name, total_apps, cnt))
-            for v in variants[:5]:
-                print("            - {}".format(v))
-            if cnt > 5:
-                print("            ... and {} more".format(cnt - 5))
-
-    # Show how many groups have N variants
-    print("\n    Distribution of variant counts per normalized name:")
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT cnt, COUNT(*) AS groups, SUM(cnt) AS total_employers
-            FROM (
-                SELECT employer_name_normalized, COUNT(*) AS cnt
-                FROM refined.employers
-                GROUP BY employer_name_normalized
-            ) sub
-            GROUP BY cnt
-            ORDER BY cnt
-        """)
-        for cnt, groups, total_emp in cur.fetchall():
-            if cnt == 1:
-                print("        {} variant:  {:,} groups ({:,} employers) -- already unique".format(
-                    cnt, groups, total_emp))
-            else:
-                print("        {} variants: {:,} groups ({:,} employers)".format(
-                    cnt, groups, total_emp))
-
-    return total_original, total_normalized
+        cur.execute("SELECT COUNT(*) FROM refined.employer_name_lookup")
+        total_rows = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(DISTINCT raw_name) FROM refined.employer_name_lookup")
+        distinct_raw = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(DISTINCT normalized_name) FROM refined.employer_name_lookup")
+        distinct_norm = cur.fetchone()[0]
+    print(f"        Total rows:              {total_rows:,}")
+    print(f"        Distinct raw_name:       {distinct_raw:,}")
+    print(f"        Distinct normalized_name: {distinct_norm:,}")
+    print(f"        Reduction:               {total_rows - distinct_norm:,} ({(total_rows - distinct_norm)/total_rows*100:.1f}%)")
 
 
-def step2_trigram_similarity(conn):
+def build_similarity_graph(conn, threshold=0.8):
     """
-    Step 2: Use pg_trgm to find fuzzy matches among normalized names.
+    Build similarity pairings on normalized names.
 
-    Blocking strategy:
-      - Only compare employers in the same state (reduces from N^2 to manageable)
-      - Use similarity() threshold >= 0.6 for candidates
-      - Exclude exact matches (already handled in Step 1)
+    similar_to includes ALL related rows:
+      - Exact matches: other rows with the same normalized_name (score=1.0)
+      - Fuzzy matches: rows with different but similar normalized_name (score >= threshold)
+
+    Columns added:
+      - id: SERIAL primary key (1..N)
+      - similar_to_id: INTEGER[] — IDs of all similar rows (excluding self)
+      - similar_to_raw: TEXT[] — corresponding raw_name values (same order)
     """
     print("\n" + "=" * 70)
-    print("STEP 2: Trigram Similarity Matching (pg_trgm)")
+    print("STEP 4: Build similarity graph (pg_trgm)")
     print("=" * 70)
 
     start = time.time()
 
     with conn.cursor() as cur:
-        # Create index for trigram similarity
-        print("\n    Creating trigram index on employer_name_normalized...")
+        # ----- 4a: Add primary key ID -----
+        print("\n    Adding primary key id column...")
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_employers_trgm
-            ON refined.employers
-            USING gin (employer_name_normalized gin_trgm_ops)
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'refined' AND table_name = 'employer_name_lookup'
+              AND column_name = 'id'
+        """)
+        if not cur.fetchone():
+            cur.execute("""
+                ALTER TABLE refined.employer_name_lookup
+                ADD COLUMN id SERIAL PRIMARY KEY
+            """)
+        else:
+            cur.execute("""
+                ALTER TABLE refined.employer_name_lookup
+                DROP CONSTRAINT IF EXISTS employer_name_lookup_pkey
+            """)
+            cur.execute("ALTER TABLE refined.employer_name_lookup DROP COLUMN id")
+            cur.execute("""
+                ALTER TABLE refined.employer_name_lookup
+                ADD COLUMN id SERIAL PRIMARY KEY
+            """)
+        conn.commit()
+        print("    [OK] id column added (1 to N)")
+
+        # ----- 4b: Dedup table for trigram comparison -----
+        print("    Creating deduplicated working table...")
+        cur.execute("DROP TABLE IF EXISTS refined._norm_dedup")
+        cur.execute("""
+            CREATE TABLE refined._norm_dedup AS
+            SELECT MIN(id) AS rep_id, normalized_name
+            FROM refined.employer_name_lookup
+            GROUP BY normalized_name
         """)
         conn.commit()
-        print("    [OK] Index created.")
 
-        # Create match candidates table
-        print("    Finding fuzzy match candidates (same state, similarity >= 0.6)...")
-        cur.execute("DROP TABLE IF EXISTS refined.employer_match_candidates")
+        cur.execute("SELECT COUNT(*) FROM refined._norm_dedup")
+        n_dedup = cur.fetchone()[0]
+        print(f"    [OK] {n_dedup:,} unique normalized names")
+
+        # ----- 4c: pg_trgm index -----
+        print("    Creating trigram index...")
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_norm_dedup_trgm
+            ON refined._norm_dedup USING gin (normalized_name gin_trgm_ops)
+        """)
         conn.commit()
 
+        cur.execute(f"SET pg_trgm.similarity_threshold = {threshold}")
+        conn.commit()
+        print(f"    [OK] trigram index ready (threshold={threshold})")
+
+        # ----- 4d: Find fuzzy pairs (different normalized names, score >= threshold) -----
+        print(f"    Finding fuzzy pairs (similarity >= {threshold})...")
+        cur.execute("DROP TABLE IF EXISTS refined._sim_pairs")
         cur.execute("""
-            CREATE TABLE refined.employer_match_candidates AS
+            CREATE TABLE refined._sim_pairs AS
             SELECT
-                a.employer_name AS name_a,
-                b.employer_name AS name_b,
-                a.employer_name_normalized AS norm_a,
-                b.employer_name_normalized AS norm_b,
-                a.employer_state AS state,
-                similarity(a.employer_name_normalized, b.employer_name_normalized) AS sim_score,
-                a.total_applications AS apps_a,
-                b.total_applications AS apps_b,
-                a.total_applications + b.total_applications AS apps_combined
-            FROM refined.employers a
-            JOIN refined.employers b
-                ON a.employer_state = b.employer_state
-                AND a.employer_name_normalized < b.employer_name_normalized
-                AND a.employer_name_normalized % b.employer_name_normalized
-            WHERE similarity(a.employer_name_normalized, b.employer_name_normalized) >= 0.6
-              AND a.employer_name_normalized != b.employer_name_normalized
+                a.normalized_name AS norm_a,
+                b.normalized_name AS norm_b,
+                similarity(a.normalized_name, b.normalized_name) AS sim_score
+            FROM refined._norm_dedup a
+            JOIN refined._norm_dedup b
+                ON a.normalized_name % b.normalized_name
+                AND a.rep_id < b.rep_id
         """)
         conn.commit()
 
-        cur.execute("SELECT COUNT(*) FROM refined.employer_match_candidates")
-        total_pairs = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM refined._sim_pairs")
+        n_fuzzy_pairs = cur.fetchone()[0]
+        elapsed_pairs = time.time() - start
+        print(f"    [OK] {n_fuzzy_pairs:,} fuzzy pairs ({elapsed_pairs:.1f}s)")
+
+        # How many normalized_names have exact-match groups (2+ raw names)?
+        cur.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT normalized_name FROM refined.employer_name_lookup
+                GROUP BY normalized_name HAVING COUNT(*) > 1
+            ) sub
+        """)
+        n_exact_groups = cur.fetchone()[0]
+        cur.execute("""
+            SELECT SUM(cnt) FROM (
+                SELECT COUNT(*) AS cnt FROM refined.employer_name_lookup
+                GROUP BY normalized_name HAVING COUNT(*) > 1
+            ) sub
+        """)
+        n_exact_rows = cur.fetchone()[0]
+        print(f"    [OK] {n_exact_groups:,} exact-match groups ({n_exact_rows:,} rows)")
+
+        # ----- 4e: Build similar_to_id and similar_to_raw columns -----
+        # For each row, collect:
+        #   1. All OTHER rows with the same normalized_name (exact matches)
+        #   2. All rows whose normalized_name is fuzzy-similar (from _sim_pairs)
+        print("\n    Building similar_to columns (exact + fuzzy)...")
+
+        # Drop old columns if they exist, add new ones
+        for col in ['similar_to', 'similar_to_id', 'similar_to_raw']:
+            cur.execute(f"""
+                ALTER TABLE refined.employer_name_lookup
+                DROP COLUMN IF EXISTS {col}
+            """)
+        cur.execute("""
+            ALTER TABLE refined.employer_name_lookup
+            ADD COLUMN similar_to_id INTEGER[] DEFAULT '{}',
+            ADD COLUMN similar_to_raw TEXT[] DEFAULT '{}'
+        """)
+        conn.commit()
+
+        # Build the full neighbor set in one query:
+        # - exact: same normalized_name, different id
+        # - fuzzy: different normalized_name linked via _sim_pairs
+        cur.execute("""
+            WITH
+            -- For each normalized_name, all IDs and raw_names
+            norm_members AS (
+                SELECT normalized_name, id, raw_name
+                FROM refined.employer_name_lookup
+            ),
+            -- Fuzzy-linked normalized_names (both directions)
+            fuzzy_links AS (
+                SELECT norm_a AS norm, norm_b AS linked_norm FROM refined._sim_pairs
+                UNION ALL
+                SELECT norm_b, norm_a FROM refined._sim_pairs
+            ),
+            -- For each row, collect all neighbor IDs:
+            --   (a) exact: same normalized_name, different row
+            --   (b) fuzzy: rows under fuzzy-linked normalized_names
+            all_neighbors AS (
+                -- (a) exact matches
+                SELECT t.id AS src_id, m.id AS nbr_id, m.raw_name AS nbr_raw
+                FROM refined.employer_name_lookup t
+                JOIN norm_members m
+                    ON t.normalized_name = m.normalized_name
+                    AND t.id != m.id
+                UNION
+                -- (b) fuzzy matches
+                SELECT t.id AS src_id, m.id AS nbr_id, m.raw_name AS nbr_raw
+                FROM refined.employer_name_lookup t
+                JOIN fuzzy_links fl ON t.normalized_name = fl.norm
+                JOIN norm_members m ON fl.linked_norm = m.normalized_name
+            ),
+            -- Aggregate per source row
+            agg AS (
+                SELECT
+                    src_id,
+                    array_agg(nbr_id ORDER BY nbr_id) AS ids,
+                    array_agg(nbr_raw ORDER BY nbr_id) AS raws
+                FROM all_neighbors
+                GROUP BY src_id
+            )
+            UPDATE refined.employer_name_lookup t
+            SET similar_to_id = a.ids,
+                similar_to_raw = a.raws
+            FROM agg a
+            WHERE t.id = a.src_id
+        """)
+        conn.commit()
+        print("    [OK] similar_to_id + similar_to_raw populated")
+
+        # ----- 4f: Stats -----
+        cur.execute("""
+            SELECT COUNT(*) FROM refined.employer_name_lookup
+            WHERE similar_to_id != '{}'
+        """)
+        rows_with_similar = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT AVG(array_length(similar_to_id, 1))
+            FROM refined.employer_name_lookup
+            WHERE similar_to_id != '{}'
+        """)
+        avg_similar = cur.fetchone()[0]
+
+        # Clean up temp tables
+        cur.execute("DROP TABLE IF EXISTS refined._norm_dedup")
+        cur.execute("DROP TABLE IF EXISTS refined._sim_pairs")
+        conn.commit()
 
     elapsed = time.time() - start
-    print("    [OK] Found {:,} candidate pairs ({:.1f}s)".format(total_pairs, elapsed))
+    print(f"\n    Rows with neighbors (exact+fuzzy): {rows_with_similar:,} / 214,366")
+    print(f"    Avg neighbor list length:          {avg_similar:.1f}")
+    print(f"    Total time: {elapsed:.1f}s")
 
-    # Show distribution by similarity score
-    print("\n    Candidate pairs by similarity score bucket:")
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-                CASE
-                    WHEN sim_score >= 0.9 THEN '0.90-1.00 (very high)'
-                    WHEN sim_score >= 0.8 THEN '0.80-0.89 (high)'
-                    WHEN sim_score >= 0.7 THEN '0.70-0.79 (medium)'
-                    WHEN sim_score >= 0.6 THEN '0.60-0.69 (low)'
-                END AS bucket,
-                COUNT(*) AS pairs,
-                SUM(apps_combined) AS total_apps_affected
-            FROM refined.employer_match_candidates
-            GROUP BY 1
-            ORDER BY 1 DESC
-        """)
-        for bucket, pairs, apps in cur.fetchall():
-            print("        {}: {:,} pairs ({:,} apps affected)".format(bucket, pairs, apps))
-
-    # Show top high-confidence matches
-    print("\n    Top 30 highest-confidence matches (sim >= 0.8, by combined apps):")
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT name_a, name_b, state, sim_score, apps_a, apps_b
-            FROM refined.employer_match_candidates
-            WHERE sim_score >= 0.8
-            ORDER BY apps_combined DESC
-            LIMIT 30
-        """)
-        for name_a, name_b, state, sim, apps_a, apps_b in cur.fetchall():
-            print("        [{:.2f}] {} ({:,}) <-> {} ({:,}) [{}]".format(
-                sim, name_a, apps_a, name_b, apps_b, state))
-
-    # Show some medium-confidence matches for review
-    print("\n    Sample medium-confidence matches (0.6-0.79, by combined apps):")
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT name_a, name_b, state, sim_score, apps_a, apps_b
-            FROM refined.employer_match_candidates
-            WHERE sim_score >= 0.6 AND sim_score < 0.8
-            ORDER BY apps_combined DESC
-            LIMIT 20
-        """)
-        for name_a, name_b, state, sim, apps_a, apps_b in cur.fetchall():
-            print("        [{:.2f}] {} ({:,}) <-> {} ({:,}) [{}]".format(
-                sim, name_a, apps_a, name_b, apps_b, state))
-
-    return total_pairs
+    return rows_with_similar
 
 
-def summary(conn, total_original, total_normalized, total_pairs):
-    """Print overall summary."""
+def evaluate_similarity(conn):
+    """Show sample similarity pairings for validation."""
     print("\n" + "=" * 70)
-    print("SUMMARY")
+    print("SIMILARITY EVALUATION")
     print("=" * 70)
 
     with conn.cursor() as cur:
-        # Count how many normalized groups have 2+ members (Step 1 merges)
+        # Distribution of neighbor list sizes
+        print("\n    Distribution of similar_to_id sizes:")
         cur.execute("""
-            SELECT COUNT(*), SUM(cnt - 1)
-            FROM (
-                SELECT employer_name_normalized, COUNT(*) AS cnt
-                FROM refined.employers
-                GROUP BY employer_name_normalized
-                HAVING COUNT(*) > 1
-            ) sub
+            SELECT
+                CASE
+                    WHEN similar_to_id = '{}' THEN '0 (unique)'
+                    WHEN array_length(similar_to_id, 1) <= 5 THEN '1-5'
+                    WHEN array_length(similar_to_id, 1) <= 10 THEN '6-10'
+                    WHEN array_length(similar_to_id, 1) <= 20 THEN '11-20'
+                    WHEN array_length(similar_to_id, 1) <= 50 THEN '21-50'
+                    ELSE '>50'
+                END AS bucket,
+                COUNT(*) AS rows
+            FROM refined.employer_name_lookup
+            GROUP BY 1
+            ORDER BY 1
         """)
-        step1_groups, step1_merges = cur.fetchone()
+        for bucket, cnt in cur.fetchall():
+            print(f"        {bucket:>12}: {cnt:>8,} rows")
 
-        # Count unique normalized names involved in Step 2 pairs
+        # Top 20 by neighbor count
+        print("\n    Top 20 rows by number of neighbors:")
         cur.execute("""
-            SELECT COUNT(DISTINCT norm_name)
-            FROM (
-                SELECT norm_a AS norm_name FROM refined.employer_match_candidates
-                UNION
-                SELECT norm_b FROM refined.employer_match_candidates
-            ) sub
+            SELECT id, raw_name, normalized_name,
+                   array_length(similar_to_id, 1) AS n
+            FROM refined.employer_name_lookup
+            WHERE similar_to_id != '{}'
+            ORDER BY array_length(similar_to_id, 1) DESC
+            LIMIT 20
         """)
-        step2_names = cur.fetchone()[0]
+        for rid, raw, norm, n in cur.fetchall():
+            print(f"        ID {rid:>6}: [{norm}] — {n} neighbors — {raw}")
 
-    print("""
-    Original employer names:           {:,}
+        # Spot-check Amazon
+        print("\n    Spot-check: Amazon")
+        cur.execute("""
+            SELECT id, raw_name, normalized_name,
+                   array_length(similar_to_id, 1) AS n,
+                   similar_to_id, similar_to_raw
+            FROM refined.employer_name_lookup
+            WHERE raw_name = 'Amazon.com Services LLC'
+        """)
+        row = cur.fetchone()
+        if row:
+            rid, raw, norm, n, ids, raws = row
+            print(f"        ID {rid}: {raw}")
+            print(f"        normalized: [{norm}], {n} neighbors:")
+            for i in range(min(n or 0, 25)):
+                print(f"            → ID {ids[i]}: {raws[i]}")
+            if (n or 0) > 25:
+                print(f"            ... and {n - 25} more")
 
-    Step 1 (deterministic normalization):
-        Distinct after normalization:  {:,}
-        Groups with 2+ variants:      {:,}
-        Names collapsed:              {:,}
+        # Spot-check Google
+        print("\n    Spot-check: Google")
+        cur.execute("""
+            SELECT id, raw_name, normalized_name,
+                   array_length(similar_to_id, 1) AS n,
+                   similar_to_id, similar_to_raw
+            FROM refined.employer_name_lookup
+            WHERE raw_name = 'Google LLC'
+        """)
+        row = cur.fetchone()
+        if row:
+            rid, raw, norm, n, ids, raws = row
+            print(f"        ID {rid}: {raw}")
+            print(f"        normalized: [{norm}], {n} neighbors:")
+            for i in range(min(n or 0, 15)):
+                print(f"            → ID {ids[i]}: {raws[i]}")
 
-    Step 2 (trigram fuzzy matching):
-        Candidate pairs found:        {:,}
-        Distinct names in candidates: {:,}
-
-    Potential total reduction:
-        Step 1 alone:                 {:,} → {:,} (-{:.1f}%)
-        Step 2 additional candidates: {:,} more names to review
-    """.format(
-        total_original,
-        total_normalized,
-        step1_groups,
-        total_original - total_normalized,
-        total_pairs,
-        step2_names,
-        total_original, total_normalized,
-        (total_original - total_normalized) / total_original * 100,
-        step2_names,
-    ))
+        # Spot-check Tata
+        print("\n    Spot-check: Tata Consultancy")
+        cur.execute("""
+            SELECT id, raw_name, normalized_name,
+                   array_length(similar_to_id, 1) AS n,
+                   similar_to_id, similar_to_raw
+            FROM refined.employer_name_lookup
+            WHERE raw_name = 'TATA CONSULTANCY SERVICES LIMITED'
+        """)
+        row = cur.fetchone()
+        if row:
+            rid, raw, norm, n, ids, raws = row
+            print(f"        ID {rid}: {raw}")
+            print(f"        normalized: [{norm}], {n} neighbors:")
+            for i in range(min(n or 0, 15)):
+                print(f"            → ID {ids[i]}: {raws[i]}")
 
 
 def main():
     conn = get_h1b_connection()
 
     try:
-        total_original, total_normalized = step1_deterministic_normalization(conn)
-        total_pairs = step2_trigram_similarity(conn)
-        summary(conn, total_original, total_normalized, total_pairs)
+        names = extract_distinct_names(conn)
+        results = normalize_all(names)
+        write_to_db(conn, results)
+        evaluate(conn, results)
+        build_similarity_graph(conn, threshold=0.8)
+        evaluate_similarity(conn)
     finally:
         conn.close()
+
+    print("\n" + "=" * 70)
+    print("DONE — refined.employer_name_lookup is ready")
+    print("    Columns: id | raw_name | normalized_name | similar_to_id | similar_to_raw")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

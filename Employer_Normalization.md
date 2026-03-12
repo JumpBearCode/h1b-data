@@ -1,282 +1,358 @@
-# Employer Name Normalization
+# Employer Name Normalization & Similarity Pipeline
 
 ## Overview
 
-The H1B LCA disclosure data contains **214,366 distinct employer names** in `refined.employers`. Many of these represent the same company with minor variations in spelling, capitalization, legal suffixes, or punctuation. This document describes the two-step normalization pipeline used to identify and group these duplicates.
+This pipeline resolves the employer name fragmentation problem in H1B LCA disclosure data.
+The same employer appears under many raw name variants due to inconsistent casing, punctuation,
+legal suffixes, and typos. The pipeline produces a lookup table (`refined.employer_name_lookup`)
+that maps every raw employer name to a canonical form and links it to all similar entries.
 
-**Key result:** Step 1 + Step 2 together identify **~87,000 employer names** (40.6%) as potential duplicates for consolidation.
+**Source**: `refined.fy_all` (3.5M application rows, 214K distinct employer names)
+
+**Output**: `refined.employer_name_lookup` (214K rows)
+
+```bash
+uv run python src/employer_normalization.py
+```
 
 ---
 
-## Step 1: Deterministic Normalization
+## Output Table Schema
 
-### Method
+```sql
+refined.employer_name_lookup
+├── id                INTEGER   -- Primary key (1..214,366)
+├── raw_name          TEXT      -- Original employer name from fy_all
+├── normalized_name   TEXT      -- Canonicalized name
+├── similar_to_id     INTEGER[] -- IDs of all similar rows (excluding self)
+└── similar_to_raw    TEXT[]    -- Corresponding raw names (same order as similar_to_id)
+```
 
-Rule-based exact-match normalization applied to every employer name:
+---
 
-1. `UPPER()` — case-insensitive
-2. Strip legal suffixes: `INCORPORATED`, `CORPORATION`, `LLC`, `LLP`, `LP`, `INC`, `CORP`, `CO`, `PC`, `PA`, `DBA`, `LIMITED`, etc.
-3. Remove punctuation: commas, periods, quotes, dashes, parentheses, slashes
-4. Collapse multiple spaces to single space
-5. `TRIM()`
+## Pipeline Architecture
 
-### Results
+```
+                    214,366 distinct raw names
+                              │
+                    Step 1: Normalization (Python)
+                    - cleanco suffix removal
+                    - custom suffix stripping
+                    - abbreviation expansion
+                    - punctuation removal
+                    - token sorting
+                              │
+                    160,706 distinct normalized names  (25% reduction)
+                              │
+                    Step 2: Similarity (PostgreSQL pg_trgm)
+                    - Trigram comparison on 160K unique normalized names
+                    - Threshold >= 0.8
+                    - 7,103 fuzzy pairs found
+                              │
+                    Step 3: Build neighbor lists
+                    - Exact matches (same normalized_name) + fuzzy matches
+                    - Write similar_to_id[] and similar_to_raw[] per row
+                              │
+                    98,817 rows have >= 1 neighbor
+                    115,549 rows are truly unique
+```
+
+---
+
+## Step 1: Normalization (Python)
+
+### What It Does
+
+Takes a raw employer name and produces a lowercase, deterministic canonical form.
+All rules are applied in `normalize_employer_name()` in `src/employer_normalization.py`.
+
+### Normalization Rules (applied in order)
+
+| # | Rule | Example |
+|---|------|---------|
+| 0 | Split glued suffixes | `SERVICESLIMITED` → `SERVICES LIMITED` |
+| 1 | `cleanco` library strips legal suffixes | `Amazon.com Services LLC` → `Amazon.com Services` |
+| 1b | Fallback: if cleanco returns empty, keep original | `SCA, Inc.` → `SCA` (not empty) |
+| 2 | Lowercase | `Amazon.com Services` → `amazon.com services` |
+| 3 | Custom suffix regex (up to 2 passes) | Strips: `inc`, `corp`, `llc`, `llp`, `lp`, `ltd`, `co`, `pc`, `pa`, `dba`, `incorporated`, `corporation`, `limited`, `limited liability company/partnership`, `professional corporation` |
+| 3b | Prevent stripping to empty | `KG INC.` → `kg` (not empty) |
+| 4 | Expand 29 abbreviations | `&` → `and`, `tech` → `technology`, `svc` → `services`, `intl` → `international`, `dev` → `development`, `info` → `information`, `eng` → `engineering`, `mgmt` → `management`, `mfg` → `manufacturing`, etc. |
+| 5 | Remove all punctuation | Non-alphanumeric chars → space |
+| 6 | Collapse whitespace | Multiple spaces → single space, trim |
+| 7 | Sort tokens alphabetically | `amazon web services` → `amazon services web` |
+
+### Normalization Examples
+
+| Raw Name | Normalized |
+|----------|-----------|
+| `Amazon.com Services LLC` | `amazon com services` |
+| `AMAZON.COM SERVICES, INC.` | `amazon com services` |
+| `Amazon Web Services, Inc.` | `amazon services web` |
+| `Ernst & Young U.S. LLP` | `ernst s u young` |
+| `TATA CONSULTANCY SERVICESLIMITED` | `consultancy services tata` |
+| `WAL-MART ASSOCIATES, INC.` | `associates mart wal` |
+| `Meta Platforms, Inc.` | `meta platforms` |
+| `JPMorgan Chase & Co.` | `chase jpmorgan` |
+
+### Why Token Sorting?
+
+Token sorting makes the normalization order-invariant:
+
+```
+"Amazon Web Services" → "amazon services web"
+"Web Services Amazon" → "amazon services web"   (same!)
+```
+
+### Normalization Statistics
 
 | Metric | Count |
 |--------|-------|
-| Original distinct employer names | 214,366 |
-| After normalization (distinct) | 161,919 |
-| Names collapsed (exact match after norm) | **52,447 (24.5%)** |
-
-### Variant Distribution
-
-| Variants per normalized name | Groups | Employers |
-|------------------------------|--------|-----------|
-| 1 (already unique) | 125,428 | 125,428 |
-| 2 | 26,464 | 52,928 |
-| 3 | 6,506 | 19,518 |
-| 4 | 2,184 | 8,736 |
-| 5 | 781 | 3,905 |
-| 6+ | 535+ | 3,851+ |
-
-### Top Collapsed Groups (by total applications)
-
-| Normalized Name | Apps | Variants | Examples |
-|-----------------|------|----------|----------|
-| COGNIZANT TECHNOLOGY SOLUTIONS US | 92,362 | 2 | `COGNIZANT TECHNOLOGY SOLUTIONS US CORP`, `Cognizant Technology Solutions US Corporation` |
-| AMAZON COM SERVICES | 82,808 | 19 | `Amazon.com Services LLC`, `AMAZON.COM SERVICES LLC`, `AMAZON.COM SERVICES, INC.`, `AMAZON.COM SERVICES, INC` |
-| GOOGLE | 60,212 | 4 | `Google LLC`, `GOOGLE LLC`, `GOOGLE INC.`, `GOOGLE, LLC` |
-| TATA CONSULTANCY SERVICES | 59,913 | 4 | `TATA CONSULTANCY SERVICES LIMITED`, `Tata Consultancy Services Limited`, `TATA CONSuLTANCY SERVICES LIMITED` |
-| ERNST & YOUNG U S | 57,449 | 3 | `Ernst & Young U.S. LLP`, `ERNST & YOUNG U.S. LLP`, `ERNST & YOUNG U.S.LLP` |
+| Original distinct raw names | 214,366 |
+| Distinct after normalization | 160,706 |
+| Names collapsed (exact match) | 53,660 (25.0%) |
+| Groups with 2+ raw variants | 37,052 |
 
 ---
 
-## Step 2: Trigram Similarity Matching (pg_trgm)
+## Step 2: Trigram Similarity (PostgreSQL pg_trgm)
 
-### Relationship to Step 1
+### What is Trigram Similarity?
 
-**Step 2 excludes Step 1 results.** Step 2 operates on the `employer_name_normalized` column (the output of Step 1) and explicitly filters out exact matches:
+A trigram is a contiguous 3-character subsequence. For example:
 
-```sql
-WHERE a.employer_name_normalized != b.employer_name_normalized
+```
+"amazon"  →  {ama, maz, azo, zon}
 ```
 
-This means Step 2 only finds **fuzzy matches that Step 1's deterministic normalization could not catch** — typos, word reordering, abbreviation differences, etc.
+The similarity between two strings is the overlap of their trigram sets:
 
-### Method
+```
+similarity = |A ∩ B| / |A ∪ B|
+```
 
-- PostgreSQL `pg_trgm` extension with GIN index on `employer_name_normalized`
-- **Blocking strategy:** Only compare employers in the **same state** (reduces N^2 to manageable comparisons)
-- Similarity threshold: `>= 0.6`
-- Deduplicated pairs: `a.employer_name_normalized < b.employer_name_normalized` (avoids A-B and B-A duplicates)
+PostgreSQL provides this via the `pg_trgm` extension with a GIN inverted index.
+The index stores a mapping of `trigram → row_ids`, so when comparing two strings,
+the database only examines rows that share enough trigrams — avoiding a full N x N scan.
 
-### Results
+### How the Comparison Works
 
-| Similarity Bucket | Pairs | Apps Affected | Interpretation |
-|-------------------|-------|---------------|----------------|
-| 0.90 - 1.00 (very high) | **3,457** | 212,697 | Almost certainly the same employer |
-| 0.80 - 0.89 (high) | **8,204** | 1,003,085 | Very likely the same employer |
-| 0.70 - 0.79 (medium) | 12,997 | 950,930 | Likely the same, needs review |
-| 0.60 - 0.69 (low) | 102,570 | 6,402,502 | Possible match, manual review needed |
-| **Total** | **127,228** | **8,569,214** | |
+1. **Deduplicate**: 214K rows → 160K unique normalized names (temp `_norm_dedup` table)
+2. **Build GIN trigram index** on the 160K unique names
+3. **Self-join** with `%` operator (threshold = 0.8) to find fuzzy pairs
+4. **Expand** fuzzy pairs back to all 214K rows
 
-### Distinct Employer Names Involved
+The comparison is 160K x 160K at the trigram level, but the GIN index makes it
+sub-quadratic — only strings sharing enough trigrams are actually compared.
 
-| Threshold | Distinct Names | % of 161,919 Normalized Names |
-|-----------|---------------|-------------------------------|
-| sim >= 0.9 | 3,146 | 1.9% |
-| sim >= 0.8 | 9,500 | 5.9% |
-| sim >= 0.6 (all) | 34,739 | 21.5% |
+### Threshold Selection
 
-### Sample High-Confidence Matches (sim >= 0.9)
+| Threshold | Pairs Found | Notes |
+|-----------|-------------|-------|
+| 0.9 | 1,108 | Very conservative, misses many true matches |
+| **0.8** | **7,103** | **Catches typos and abbreviation differences, few false positives** |
+| 0.7 | 41,836 | Too noisy: matches different school districts, different hospitals |
+| 0.6 | 520,571 | Unusable: massive false positives for short generic names |
 
-| Score | Employer A (Apps) | Employer B (Apps) | State |
-|-------|-------------------|-------------------|-------|
-| 1.00 | JPMorgan & Chase Co. (4) | JPMorgan Chase & Co. (13,124) | IL |
-| 1.00 | JPMorgan Chase & Co. (13,124) | JPMorgan Chase& Co. (1) | IL |
-| 1.00 | JPMorgan & Chase Co. (4) | JPMORGAN CHASE & CO. (7,070) | IL |
-| 0.93 | 1 TATA CONSULTANCY SERVICES LIMITED (1) | TATA CONSULTANCY SERVICES LIMITED (38,159) | MD |
-
-### Sample Medium-Confidence Matches (0.80 - 0.89)
-
-| Score | Employer A (Apps) | Employer B (Apps) | State |
-|-------|-------------------|-------------------|-------|
-| 0.80 | Amazon.com Services LLC (60,910) | AMAZON SERVICES LLC (8) | WA |
-| 0.86 | AMAZON.COM SERVICE, INC. (1) | Amazon.com Services LLC (60,910) | WA |
-| 0.83 | Amazon.com Services LLC (60,910) | AMAZON.COM WEB SERVICES. INC (1) | WA |
+**0.8** is used because:
+- Catches real variations: `amazon services` ↔ `amazon com services` (0.80)
+- Catches typos: `consultancy servies tata` ↔ `consultancy services tata` (0.83)
+- Avoids false positives: `elkton nursing` ↔ `ruston nursing` (0.79, different entities) is excluded
 
 ---
 
-## Combined Impact
+## Step 3: Building Neighbor Lists
 
-```
-Original employer names:                  214,366
+For each of the 214K rows, `similar_to_id` and `similar_to_raw` contain **all** related rows
+from two sources:
 
-Step 1 (deterministic normalization):
-    Distinct after normalization:          161,919
-    Names collapsed:                       52,447  (24.5%)
+1. **Exact matches** (score = 1.0): Other rows with the **same** `normalized_name` but different `raw_name`
+2. **Fuzzy matches** (score >= 0.8): Rows with a **different but similar** `normalized_name`
 
-Step 2 (trigram fuzzy matching):
-    Additional candidate names to review:  34,739  (21.5% of normalized)
-    High-confidence (sim >= 0.8):          9,500 names in 11,661 pairs
-    Very high confidence (sim >= 0.9):     3,146 names in 3,457 pairs
-```
+Each row excludes itself from its own neighbor list.
 
----
+This is implemented as a single SQL CTE that UNIONs exact and fuzzy neighbors, then
+aggregates per source row with `array_agg`.
 
-## Database Artifacts
+### Neighbor Distribution
 
-| Object | Type | Description |
-|--------|------|-------------|
-| `refined.employers.employer_name_normalized` | Column (TEXT) | Deterministically normalized employer name |
-| `refined.employer_match_candidates` | Table | Fuzzy match candidate pairs with similarity scores |
-| `idx_employers_trgm` | GIN Index | Trigram index on `employer_name_normalized` |
-
-### `refined.employer_match_candidates` Schema
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `name_a` | TEXT | Original employer name A |
-| `name_b` | TEXT | Original employer name B |
-| `norm_a` | TEXT | Normalized name A |
-| `norm_b` | TEXT | Normalized name B |
-| `state` | TEXT | Shared employer state (blocking key) |
-| `sim_score` | FLOAT | Trigram similarity score (0.6 - 1.0) |
-| `apps_a` | INTEGER | Total applications for employer A |
-| `apps_b` | INTEGER | Total applications for employer B |
-| `apps_combined` | INTEGER | Sum of apps_a + apps_b |
+| Neighbor Count | Rows |
+|----------------|------|
+| 0 (unique) | 115,549 |
+| 1-5 | 95,191 |
+| 6-10 | 3,127 |
+| 11-20 | 374 |
+| 21-50 | 121 |
+| >50 | 4 |
 
 ---
 
-## Sample Queries
+## Sample Output
 
-### 1. Search for a specific employer's matches
+### Amazon.com Services LLC (ID 10762)
 
-```sql
--- Find all fuzzy matches for a specific employer (e.g., "Amazon")
-SELECT name_a, name_b, state, sim_score, apps_a, apps_b
-FROM refined.employer_match_candidates
-WHERE name_a ILIKE '%amazon%' OR name_b ILIKE '%amazon%'
-ORDER BY sim_score DESC, apps_combined DESC;
+Normalized: `amazon com services` — **23 neighbors**
+
+19 exact matches (same normalized name) + 4 fuzzy matches (different normalized name):
+
+| ID | raw_name | Match Type |
+|----|----------|------------|
+| 10678 | AMAZON COM SERVICES LLC | exact |
+| 10758 | AMAZON. COM SERVICES LLC | exact |
+| 10760 | Amazon.com Services | exact |
+| 10761 | AMAZON.COM SERVICES  LLC | exact |
+| 10763 | Amazon.Com Services Llc | exact |
+| 10764 | AMAZoN.COM SERVICES LLC | exact |
+| 10765 | AMAZON.COM SERVICEs LLC | exact |
+| 10766 | AMAZON.COM SERVICES LLC | exact |
+| 10769 | Amazon.com Services LLC. | exact |
+| 10770 | AMAZON.COM SERVICES LLC. | exact |
+| 10771 | Amazon.com Services, Inc | exact |
+| 10772 | AMAZON.COM SERVICES, INC | exact |
+| 10773 | Amazon.com Services, Inc. | exact |
+| 10774 | Amazon.com Services, Inc.† | exact |
+| 10775 | AMAZON.COM SERVICES, INC. | exact |
+| 10776 | Amazon.com Services, Inc. (trailing whitespace) | exact |
+| 10777 | Amazon.com Services, LLC | exact |
+| 10778 | AMAZON.COM SERVICES, LLC | exact |
+| 10779 | Amazon.com Services, LLC. | exact |
+| 10729 | Amazon Services LLC | fuzzy (0.80) |
+| 10730 | AMAZON SERVICES LLC | fuzzy (0.80) |
+| 10759 | AMAZON.COM SERVICE, INC. | fuzzy (0.86) |
+| 10780 | AMAZON.COM WEB SERVICES. INC | fuzzy (0.83) |
+
+### Google LLC (ID 79467)
+
+Normalized: `google` — **3 neighbors**
+
+| ID | raw_name |
+|----|----------|
+| 79466 | GOOGLE INC. |
+| 79468 | GOOGLE LLC |
+| 79471 | GOOGLE, LLC |
+
+### TATA CONSULTANCY SERVICES LIMITED (ID 183647)
+
+Normalized: `consultancy services tata` — **5 neighbors**
+
+| ID | raw_name | Notes |
+|----|----------|-------|
+| 116 | 1 TATA CONSULTANCY SERVICES LIMITED | Prefix "1" (data entry artifact) |
+| 183645 | Tata Consultancy Services Limited | Case difference |
+| 183646 | TATA CONSuLTANCY SERVICES LIMITED | Typo in casing |
+| 183648 | TATA CONSULTANCY SERVICESLIMITED | Glued suffix |
+| 183649 | TATA CONSULTANCY SERVIES LIMITED | Typo: SERVIES |
+
+### Microsoft Corporation (ID 122233)
+
+Normalized: `microsoft` — **1 neighbor**
+
+| ID | raw_name |
+|----|----------|
+| 122234 | MICROSOFT CORPORATION |
+
+### Unique Employer (no neighbors)
+
+| ID | raw_name | normalized_name |
+|----|----------|-----------------|
+| 10 | Better Nutritionals, LLC | better nutritionals |
+| 23 | Future Textiles, Inc | future textiles |
+| 34 | LEELA SERVICES INC. | leela services |
+
+---
+
+## Code Architecture
+
+### File: `src/employer_normalization.py`
+
+```
+main()
+ ├── extract_distinct_names(conn)     # SQL: SELECT DISTINCT from fy_all → 214K names
+ ├── normalize_all(names)             # Python: normalize_employer_name() on each name
+ ├── write_to_db(conn, results)       # SQL: CREATE TABLE + batch INSERT (psycopg2 execute_values)
+ ├── evaluate(conn, results)          # Print normalization stats and spot-checks
+ ├── build_similarity_graph(conn)     # SQL: pg_trgm trigram matching → neighbor arrays
+ └── evaluate_similarity(conn)        # Print similarity stats and spot-checks
 ```
 
-### 2. Find all Step 1 variants for a normalized name
+### Key Functions
+
+**`normalize_employer_name(raw_name) → str`**
+
+Pure Python function. Takes one raw name string, returns the normalized form.
+Uses `cleanco.basename()` for international suffix removal, then applies custom regex
+rules, abbreviation expansion, punctuation removal, and token sorting.
+Called 214K times (once per distinct raw name). Takes ~5 seconds total.
+
+**`build_similarity_graph(conn, threshold=0.8)`**
+
+Runs entirely in PostgreSQL. Steps:
+
+1. Add `id SERIAL PRIMARY KEY` to the lookup table
+2. Create temp `_norm_dedup` table with 160K unique normalized names
+3. Build GIN trigram index on `_norm_dedup`
+4. Self-join with `%` operator to find 7,103 fuzzy pairs
+5. Build neighbor arrays via a single CTE:
+   - **Part (a)**: exact matches — `JOIN ON normalized_name = normalized_name AND id != id`
+   - **Part (b)**: fuzzy matches — `JOIN via _sim_pairs → JOIN back to all IDs under linked normalized_name`
+   - `UNION` both parts, `array_agg(ORDER BY id)` to produce `similar_to_id[]` and `similar_to_raw[]`
+6. Clean up temp tables
+
+Takes ~2 minutes total (dominated by the trigram self-join).
+
+### Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `cleanco` | Legal suffix removal (handles international forms: GmbH, S.A., Pty Ltd, etc.) |
+| `rapidfuzz` | Installed for potential future use (Python-side fuzzy matching) |
+| `psycopg2-binary` | PostgreSQL driver |
+| `pg_trgm` | PostgreSQL extension for trigram similarity (server-side) |
+
+---
+
+## How To Query
 
 ```sql
--- See all original names that collapsed to the same normalized form
-SELECT employer_name, employer_name_normalized, total_applications,
-       employer_city, employer_state
-FROM refined.employers
-WHERE employer_name_normalized LIKE '%GOOGLE%'
-ORDER BY total_applications DESC;
-```
+-- Find all variants of a company by normalized name
+SELECT id, raw_name, normalized_name
+FROM refined.employer_name_lookup
+WHERE normalized_name = 'amazon com services';
 
-### 3. High-confidence matches with the most applications
+-- Find an employer and see all its neighbors
+SELECT id, raw_name, similar_to_id, similar_to_raw
+FROM refined.employer_name_lookup
+WHERE raw_name = 'Amazon.com Services LLC';
 
-```sql
--- Top 50 match pairs most worth merging (high confidence, high volume)
-SELECT name_a, name_b, state, sim_score, apps_a, apps_b, apps_combined
-FROM refined.employer_match_candidates
-WHERE sim_score >= 0.8
-ORDER BY apps_combined DESC
-LIMIT 50;
-```
-
-### 4. All match candidates for a specific state
-
-```sql
--- Review fuzzy matches in California
-SELECT name_a, name_b, sim_score, apps_a, apps_b
-FROM refined.employer_match_candidates
-WHERE state = 'CA'
-  AND sim_score >= 0.8
-ORDER BY apps_combined DESC
-LIMIT 100;
-```
-
-### 5. Count potential merges by similarity threshold
-
-```sql
--- How many distinct employer names could be reduced at each threshold?
-SELECT
-    CASE
-        WHEN sim_score >= 0.9 THEN '0.90+'
-        WHEN sim_score >= 0.8 THEN '0.80-0.89'
-        WHEN sim_score >= 0.7 THEN '0.70-0.79'
-        WHEN sim_score >= 0.6 THEN '0.60-0.69'
-    END AS bucket,
-    COUNT(*) AS pairs,
-    COUNT(DISTINCT norm_a) + COUNT(DISTINCT norm_b) AS approx_names_involved,
-    SUM(apps_combined) AS total_apps_affected
-FROM refined.employer_match_candidates
-GROUP BY 1
-ORDER BY 1 DESC;
-```
-
-### 6. Find employers with both Step 1 AND Step 2 matches
-
-```sql
--- Employers that had Step 1 variants AND are also in Step 2 fuzzy matches
-SELECT e.employer_name_normalized,
-       COUNT(DISTINCT e.employer_name) AS step1_variants,
-       COUNT(DISTINCT mc.norm_b) AS step2_fuzzy_matches,
-       SUM(e.total_applications) AS total_apps
-FROM refined.employers e
-JOIN refined.employer_match_candidates mc
-    ON e.employer_name_normalized = mc.norm_a
-GROUP BY e.employer_name_normalized
-HAVING COUNT(DISTINCT e.employer_name) > 1
+-- Join back to fy_all to get application counts per normalized group
+SELECT l.normalized_name, COUNT(*) AS total_apps
+FROM refined.fy_all f
+JOIN refined.employer_name_lookup l ON f.employer_name = l.raw_name
+GROUP BY l.normalized_name
 ORDER BY total_apps DESC
 LIMIT 20;
-```
 
-### 7. Full picture for a single employer
-
-```sql
--- Complete view: all names associated with "MICROSOFT" through both steps
-WITH step1 AS (
-    SELECT employer_name, employer_name_normalized, total_applications
-    FROM refined.employers
-    WHERE employer_name_normalized LIKE '%MICROSOFT%'
-),
-step2 AS (
-    SELECT DISTINCT
-        CASE WHEN norm_a LIKE '%MICROSOFT%' THEN norm_b ELSE norm_a END AS related_norm,
-        sim_score
-    FROM refined.employer_match_candidates
-    WHERE norm_a LIKE '%MICROSOFT%' OR norm_b LIKE '%MICROSOFT%'
-)
-SELECT 'Step 1' AS source, employer_name, employer_name_normalized, total_applications, NULL AS sim_score
-FROM step1
-UNION ALL
-SELECT 'Step 2', e.employer_name, e.employer_name_normalized, e.total_applications, s2.sim_score
-FROM step2 s2
-JOIN refined.employers e ON e.employer_name_normalized = s2.related_norm
-ORDER BY source, total_applications DESC;
+-- Find employers with the most name variants
+SELECT normalized_name, COUNT(*) AS n_variants
+FROM refined.employer_name_lookup
+GROUP BY normalized_name
+HAVING COUNT(*) > 5
+ORDER BY n_variants DESC
+LIMIT 20;
 ```
 
 ---
 
 ## Reproducibility
 
-To re-run the normalization pipeline:
-
 ```bash
 uv run python src/employer_normalization.py
 ```
 
 This will:
-1. Add/update `employer_name_normalized` column on `refined.employers`
-2. Drop and recreate `refined.employer_match_candidates` with fresh fuzzy matches
-3. Print detailed statistics to stdout
+1. Extract 214K distinct employer names from `refined.fy_all`
+2. Normalize all names in Python (cleanco + custom rules)
+3. Write results to `refined.employer_name_lookup` (drops and recreates)
+4. Build trigram similarity graph and populate `similar_to_id[]` / `similar_to_raw[]`
+5. Print detailed statistics and spot-checks to stdout
 
-**Prerequisites:** `pg_trgm` extension must be enabled (`CREATE EXTENSION IF NOT EXISTS pg_trgm;`).
-
----
-
-## Next Steps (Future Work)
-
-1. **Apply high-confidence merges (sim >= 0.9):** Auto-merge the 3,457 pairs into canonical employer names
-2. **Review medium-confidence matches (0.8-0.89):** Manual or semi-automated review of 8,204 pairs
-3. **Create canonical employer mapping table:** `refined.employer_canonical` mapping all variant names to a single canonical name
-4. **Consider embedding-based matching:** For catching semantic matches that trigram similarity misses (e.g., "IBM" vs "International Business Machines")
+**Prerequisites:** PostgreSQL `pg_trgm` extension (auto-created by the script via `CREATE EXTENSION IF NOT EXISTS pg_trgm`).
